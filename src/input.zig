@@ -1,9 +1,15 @@
 //! Input - ZirconOS Modern Input Handling
-//! Manages keyboard hotkeys, mouse/touch cursor state, edge gestures
-//! (swipe from right=charms, left=recent apps, bottom=app bar),
-//! and hot corner detection.
+//! Manages keyboard hotkeys, mouse cursor state, and global
+//! input dispatch. Provides registration for shell hotkeys
+//! (Win, Win+D, Win+L, Alt+F4, etc.) and tracks modifier
+//! key state for combo detection.
+//! Metro: standard cursor interpolation, no special glass effects.
+//! Reference: ReactOS user32 input handling (win32ss/user/user32/)
 
 pub const MAX_HOTKEYS: usize = 32;
+pub const MAX_CURSOR_TYPES: usize = 12;
+
+pub const INTERPOLATION_PRECISION: i32 = 256;
 
 pub const ModifierFlags = struct {
     ctrl: bool = false,
@@ -35,6 +41,20 @@ pub const CursorType = enum(u8) {
     app_starting = 11,
 };
 
+pub const SmoothCursorState = struct {
+    target_x: i32 = 0,
+    target_y: i32 = 0,
+    display_x: i32 = 0,
+    display_y: i32 = 0,
+    sub_x: i32 = 0,
+    sub_y: i32 = 0,
+    velocity_x: i32 = 0,
+    velocity_y: i32 = 0,
+    lerp_factor: u8 = 220,
+    is_moving: bool = false,
+    frames_since_move: u32 = 0,
+};
+
 pub const MouseState = struct {
     x: i32 = 0,
     y: i32 = 0,
@@ -50,6 +70,8 @@ pub const MouseState = struct {
     drag_start_y: i32 = 0,
     is_dragging: bool = false,
     drag_threshold: i32 = 4,
+    scroll_delta: i32 = 0,
+    smooth: SmoothCursorState = .{},
 };
 
 pub const KeyboardState = struct {
@@ -61,63 +83,28 @@ pub const KeyboardState = struct {
     repeat_count: u32 = 0,
 };
 
-// ── Edge Gesture System ──
-
-pub const EdgeGesture = enum(u8) {
-    none = 0,
-    right_charms = 1,
-    left_recent_apps = 2,
-    bottom_app_bar = 3,
-    top_app_commands = 4,
-};
-
-pub const EdgeGestureState = struct {
-    active_gesture: EdgeGesture = .none,
-    gesture_start_x: i32 = 0,
-    gesture_start_y: i32 = 0,
-    gesture_progress: i32 = 0,
-    is_tracking: bool = false,
-    charms_callback: ?*const fn () void = null,
-    recent_apps_callback: ?*const fn () void = null,
-    app_bar_callback: ?*const fn () void = null,
-};
-
-pub const HotCorner = enum(u8) {
-    none = 0,
-    top_left = 1,
-    bottom_left = 2,
-    top_right = 3,
-    bottom_right = 4,
-};
-
-const EDGE_THRESHOLD: i32 = 2;
-const GESTURE_ACTIVATE_DISTANCE: i32 = 20;
-const HOT_CORNER_SIZE: i32 = 6;
-
 var hotkeys: [MAX_HOTKEYS]HotkeyEntry = [_]HotkeyEntry{.{}} ** MAX_HOTKEYS;
 var hotkey_count: usize = 0;
 var next_hotkey_id: u32 = 1;
 
 var mouse: MouseState = .{};
 var keyboard: KeyboardState = .{};
-var edge_state: EdgeGestureState = .{};
 var input_initialized: bool = false;
 var input_tick: u64 = 0;
 
-var screen_width: i32 = 1024;
-var screen_height: i32 = 768;
+var screen_width: i32 = 1280;
+var screen_height: i32 = 800;
 
 pub fn init() void {
     hotkey_count = 0;
     next_hotkey_id = 1;
     mouse = .{};
     keyboard = .{};
-    edge_state = .{};
     input_tick = 0;
     input_initialized = true;
 }
 
-pub fn setScreenSize(w: i32, h: i32) void {
+pub fn setScreenBounds(w: i32, h: i32) void {
     screen_width = w;
     screen_height = h;
 }
@@ -177,18 +164,104 @@ pub fn processKeyUp(vk_code: u8) void {
 }
 
 pub fn processMouseMove(x: i32, y: i32) void {
-    mouse.x = x;
-    mouse.y = y;
+    const clamped_x = clamp(x, 0, screen_width - 1);
+    const clamped_y = clamp(y, 0, screen_height - 1);
+
+    mouse.smooth.target_x = clamped_x;
+    mouse.smooth.target_y = clamped_y;
+
+    mouse.smooth.velocity_x = clamped_x - mouse.x;
+    mouse.smooth.velocity_y = clamped_y - mouse.y;
+    mouse.smooth.is_moving = true;
+    mouse.smooth.frames_since_move = 0;
+
+    updateSmoothCursor();
+
+    mouse.x = mouse.smooth.display_x;
+    mouse.y = mouse.smooth.display_y;
 
     if (mouse.left_down and !mouse.is_dragging) {
-        const dx = x - mouse.drag_start_x;
-        const dy = y - mouse.drag_start_y;
+        const dx = mouse.x - mouse.drag_start_x;
+        const dy = mouse.y - mouse.drag_start_y;
         if (dx * dx + dy * dy > mouse.drag_threshold * mouse.drag_threshold) {
             mouse.is_dragging = true;
         }
     }
+}
 
-    updateEdgeGestures(x, y);
+pub fn processMouseMoveRelative(dx: i16, dy: i16) void {
+    const new_x = mouse.smooth.target_x + @as(i32, dx);
+    const new_y = mouse.smooth.target_y + @as(i32, dy);
+    processMouseMove(new_x, new_y);
+}
+
+fn updateSmoothCursor() void {
+    const tx = mouse.smooth.target_x * INTERPOLATION_PRECISION;
+    const ty = mouse.smooth.target_y * INTERPOLATION_PRECISION;
+
+    const cx = mouse.smooth.sub_x;
+    const cy = mouse.smooth.sub_y;
+
+    const factor: i32 = @as(i32, mouse.smooth.lerp_factor);
+
+    mouse.smooth.sub_x = cx + @divTrunc((tx - cx) * factor, 256);
+    mouse.smooth.sub_y = cy + @divTrunc((ty - cy) * factor, 256);
+
+    mouse.smooth.display_x = @divTrunc(mouse.smooth.sub_x + INTERPOLATION_PRECISION / 2, INTERPOLATION_PRECISION);
+    mouse.smooth.display_y = @divTrunc(mouse.smooth.sub_y + INTERPOLATION_PRECISION / 2, INTERPOLATION_PRECISION);
+
+    mouse.smooth.display_x = clamp(mouse.smooth.display_x, 0, screen_width - 1);
+    mouse.smooth.display_y = clamp(mouse.smooth.display_y, 0, screen_height - 1);
+}
+
+pub fn updateInterpolation() void {
+    if (!mouse.smooth.is_moving) return;
+
+    updateSmoothCursor();
+    mouse.x = mouse.smooth.display_x;
+    mouse.y = mouse.smooth.display_y;
+
+    const dx = mouse.smooth.target_x - mouse.smooth.display_x;
+    const dy = mouse.smooth.target_y - mouse.smooth.display_y;
+    if (dx * dx + dy * dy <= 1) {
+        mouse.smooth.display_x = mouse.smooth.target_x;
+        mouse.smooth.display_y = mouse.smooth.target_y;
+        mouse.smooth.sub_x = mouse.smooth.target_x * INTERPOLATION_PRECISION;
+        mouse.smooth.sub_y = mouse.smooth.target_y * INTERPOLATION_PRECISION;
+        mouse.x = mouse.smooth.target_x;
+        mouse.y = mouse.smooth.target_y;
+
+        mouse.smooth.frames_since_move += 1;
+        if (mouse.smooth.frames_since_move > 3) {
+            mouse.smooth.is_moving = false;
+            mouse.smooth.velocity_x = 0;
+            mouse.smooth.velocity_y = 0;
+        }
+    }
+}
+
+pub fn snapCursorToTarget() void {
+    mouse.x = mouse.smooth.target_x;
+    mouse.y = mouse.smooth.target_y;
+    mouse.smooth.display_x = mouse.smooth.target_x;
+    mouse.smooth.display_y = mouse.smooth.target_y;
+    mouse.smooth.sub_x = mouse.smooth.target_x * INTERPOLATION_PRECISION;
+    mouse.smooth.sub_y = mouse.smooth.target_y * INTERPOLATION_PRECISION;
+    mouse.smooth.velocity_x = 0;
+    mouse.smooth.velocity_y = 0;
+    mouse.smooth.is_moving = false;
+}
+
+pub fn setSmoothingFactor(factor: u8) void {
+    mouse.smooth.lerp_factor = if (factor < 64) 64 else factor;
+}
+
+pub fn isCursorMoving() bool {
+    return mouse.smooth.is_moving;
+}
+
+pub fn getCursorVelocity() struct { vx: i32, vy: i32 } {
+    return .{ .vx = mouse.smooth.velocity_x, .vy = mouse.smooth.velocity_y };
 }
 
 pub fn processMouseDown(button: u8, x: i32, y: i32) bool {
@@ -200,10 +273,6 @@ pub fn processMouseDown(button: u8, x: i32, y: i32) bool {
             mouse.left_down = true;
             mouse.drag_start_x = x;
             mouse.drag_start_y = y;
-
-            if (isAtEdge(x, y) != .none) {
-                beginEdgeGesture(x, y);
-            }
 
             const is_double = isDoubleClick(x, y);
             mouse.last_click_x = x;
@@ -230,9 +299,6 @@ pub fn processMouseUp(button: u8, x: i32, y: i32) void {
         0 => {
             mouse.left_down = false;
             mouse.is_dragging = false;
-            if (edge_state.is_tracking) {
-                endEdgeGesture();
-            }
         },
         1 => mouse.right_down = false,
         2 => mouse.middle_down = false,
@@ -240,81 +306,9 @@ pub fn processMouseUp(button: u8, x: i32, y: i32) void {
     }
 }
 
-// ── Edge Gesture Detection ──
-
-fn isAtEdge(x: i32, y: i32) EdgeGesture {
-    if (x >= screen_width - EDGE_THRESHOLD) return .right_charms;
-    if (x <= EDGE_THRESHOLD and y > HOT_CORNER_SIZE and y < screen_height - HOT_CORNER_SIZE) return .left_recent_apps;
-    if (y >= screen_height - EDGE_THRESHOLD) return .bottom_app_bar;
-    if (y <= EDGE_THRESHOLD and x > HOT_CORNER_SIZE and x < screen_width - HOT_CORNER_SIZE) return .top_app_commands;
-    return .none;
+pub fn processMouseScroll(delta: i32) void {
+    mouse.scroll_delta = delta;
 }
-
-fn beginEdgeGesture(x: i32, y: i32) void {
-    edge_state.active_gesture = isAtEdge(x, y);
-    edge_state.gesture_start_x = x;
-    edge_state.gesture_start_y = y;
-    edge_state.gesture_progress = 0;
-    edge_state.is_tracking = true;
-}
-
-fn updateEdgeGestures(x: i32, y: i32) void {
-    if (!edge_state.is_tracking) return;
-
-    const progress: i32 = switch (edge_state.active_gesture) {
-        .right_charms => edge_state.gesture_start_x - x,
-        .left_recent_apps => x - edge_state.gesture_start_x,
-        .bottom_app_bar => edge_state.gesture_start_y - y,
-        .top_app_commands => y - edge_state.gesture_start_y,
-        .none => 0,
-    };
-
-    edge_state.gesture_progress = if (progress > 0) progress else 0;
-}
-
-fn endEdgeGesture() void {
-    if (edge_state.gesture_progress >= GESTURE_ACTIVATE_DISTANCE) {
-        switch (edge_state.active_gesture) {
-            .right_charms => {
-                if (edge_state.charms_callback) |cb| cb();
-            },
-            .left_recent_apps => {
-                if (edge_state.recent_apps_callback) |cb| cb();
-            },
-            .bottom_app_bar => {
-                if (edge_state.app_bar_callback) |cb| cb();
-            },
-            else => {},
-        }
-    }
-    edge_state.is_tracking = false;
-    edge_state.active_gesture = .none;
-    edge_state.gesture_progress = 0;
-}
-
-pub fn detectHotCorner(x: i32, y: i32) HotCorner {
-    if (x < HOT_CORNER_SIZE and y < HOT_CORNER_SIZE) return .top_left;
-    if (x < HOT_CORNER_SIZE and y >= screen_height - HOT_CORNER_SIZE) return .bottom_left;
-    if (x >= screen_width - HOT_CORNER_SIZE and y < HOT_CORNER_SIZE) return .top_right;
-    if (x >= screen_width - HOT_CORNER_SIZE and y >= screen_height - HOT_CORNER_SIZE) return .bottom_right;
-    return .none;
-}
-
-pub fn setEdgeCallbacks(
-    charms: ?*const fn () void,
-    recent_apps: ?*const fn () void,
-    app_bar: ?*const fn () void,
-) void {
-    edge_state.charms_callback = charms;
-    edge_state.recent_apps_callback = recent_apps;
-    edge_state.app_bar_callback = app_bar;
-}
-
-pub fn getEdgeGestureState() *const EdgeGestureState {
-    return &edge_state;
-}
-
-// ── Standard Accessors ──
 
 pub fn setCursor(cursor_type: CursorType) void {
     mouse.cursor = cursor_type;
@@ -342,6 +336,7 @@ pub fn isKeyDown(vk_code: u8) bool {
 
 pub fn tick() void {
     input_tick += 1;
+    updateInterpolation();
 }
 
 pub fn getHotkeyCount() usize {
@@ -391,4 +386,10 @@ pub fn cursorForHitTest(hit: u8) CursorType {
         2 => .arrow,
         else => .arrow,
     };
+}
+
+fn clamp(val: i32, min_val: i32, max_val: i32) i32 {
+    if (val < min_val) return min_val;
+    if (val > max_val) return max_val;
+    return val;
 }

@@ -1,175 +1,63 @@
-//! Desktop Manager - ZirconOS Modern Minimal Desktop
-//! Secondary to the Start Screen. Simplified with only
-//! PC and Recycle Bin icons, flat right-click menu.
+//! Modern Desktop Manager
+//! Manages wallpaper (solid accent color), desktop icon grid, and context menus.
+//! Windows 8 Metro style: flat icons on a bold solid-color background.
 
 const theme = @import("theme.zig");
 
-pub const COLORREF = theme.COLORREF;
-
-// ── Desktop Icon ──
-
-pub const MAX_DESKTOP_ICONS: usize = 32;
-pub const MAX_ICON_NAME_LEN: usize = 48;
-pub const MAX_ICON_PATH_LEN: usize = 128;
-
-pub const IconType = enum(u8) {
-    this_pc = 0,
-    recycle_bin = 1,
-    folder = 2,
-    file = 3,
-    shortcut = 4,
-    control_panel = 5,
-};
-
 pub const DesktopIcon = struct {
-    name: [MAX_ICON_NAME_LEN]u8 = [_]u8{0} ** MAX_ICON_NAME_LEN,
-    name_len: usize = 0,
-    target_path: [MAX_ICON_PATH_LEN]u8 = [_]u8{0} ** MAX_ICON_PATH_LEN,
-    target_path_len: usize = 0,
-    icon_type: IconType = .file,
+    name: [64]u8 = [_]u8{0} ** 64,
+    name_len: u8 = 0,
     grid_x: i32 = 0,
     grid_y: i32 = 0,
-    pixel_x: i32 = 0,
-    pixel_y: i32 = 0,
-    is_selected: bool = false,
-    is_visible: bool = true,
-    is_system: bool = false,
-
-    pub fn getName(self: *const DesktopIcon) []const u8 {
-        return self.name[0..self.name_len];
-    }
-
-    pub fn getTargetPath(self: *const DesktopIcon) []const u8 {
-        return self.target_path[0..self.target_path_len];
-    }
+    icon_id: u16 = 0,
+    selected: bool = false,
+    visible: bool = false,
 };
 
-// ── Wallpaper ──
-
-pub const WallpaperStyle = enum(u8) {
-    solid_color = 0,
-    fill = 1,
-    fit = 2,
-    stretch = 3,
-    tile = 4,
-    center = 5,
-    span = 6,
-};
-
-pub const Wallpaper = struct {
-    path: [MAX_ICON_PATH_LEN]u8 = [_]u8{0} ** MAX_ICON_PATH_LEN,
-    path_len: usize = 0,
-    style: WallpaperStyle = .solid_color,
-    solid_color: COLORREF = 0,
-    is_set: bool = false,
-
-    pub fn getPath(self: *const Wallpaper) []const u8 {
-        return self.path[0..self.path_len];
-    }
-};
-
-// ── Context Menu ── (flat Metro style)
-
-pub const MAX_CONTEXT_ITEMS: usize = 16;
-
-pub const ContextMenuItemType = enum(u8) {
-    normal = 0,
-    separator = 1,
-    submenu = 2,
-    disabled = 3,
-};
-
-pub const ContextMenuItem = struct {
-    label: [48]u8 = [_]u8{0} ** 48,
-    label_len: usize = 0,
-    item_type: ContextMenuItemType = .normal,
-    command_id: u32 = 0,
-    is_highlighted: bool = false,
-
-    pub fn getLabel(self: *const ContextMenuItem) []const u8 {
-        return self.label[0..self.label_len];
-    }
-};
-
-pub const ContextMenu = struct {
-    items: [MAX_CONTEXT_ITEMS]ContextMenuItem = [_]ContextMenuItem{.{}} ** MAX_CONTEXT_ITEMS,
-    item_count: usize = 0,
-    x: i32 = 0,
-    y: i32 = 0,
-    is_visible: bool = false,
-    highlight_index: i32 = -1,
-};
-
-// ── Desktop Settings ──
-
-pub const DesktopSettings = struct {
-    show_this_pc: bool = true,
-    show_recycle_bin: bool = true,
-    auto_arrange: bool = true,
-    align_to_grid: bool = true,
-    icon_spacing_x: i32 = theme.DESKTOP_ICON_SPACING_X,
-    icon_spacing_y: i32 = theme.DESKTOP_ICON_SPACING_Y,
-};
-
-// ── Global State ──
-
-var icons: [MAX_DESKTOP_ICONS]DesktopIcon = [_]DesktopIcon{.{}} ** MAX_DESKTOP_ICONS;
+const MAX_ICONS: usize = 128;
+var icons: [MAX_ICONS]DesktopIcon = [_]DesktopIcon{.{}} ** MAX_ICONS;
 var icon_count: usize = 0;
-var wallpaper: Wallpaper = .{};
-var context_menu: ContextMenu = .{};
-var settings: DesktopSettings = .{};
 
-var desktop_width: i32 = 800;
-var desktop_height: i32 = 600;
-var desktop_initialized: bool = false;
+var context_menu_visible: bool = false;
+var context_menu_x: i32 = 0;
+var context_menu_y: i32 = 0;
 
-// ── Icon Management ──
+var wallpaper_path: theme.WallpaperPath = .{};
+var wallpaper_dirty: bool = true;
 
-pub fn addIcon(
-    name: []const u8,
-    target_path: []const u8,
-    icon_type: IconType,
-    is_system: bool,
-) ?*DesktopIcon {
-    if (icon_count >= MAX_DESKTOP_ICONS) return null;
+pub fn init() void {
+    icon_count = 0;
+    context_menu_visible = false;
+    wallpaper_dirty = true;
+    updateWallpaperPath();
+    addDefaultIcons();
+}
 
-    var icon = &icons[icon_count];
-    icon.* = .{};
-    icon.icon_type = icon_type;
-    icon.is_system = is_system;
-    icon.is_visible = true;
+fn addDefaultIcons() void {
+    addIcon("This PC", 0, 0, 1);
+    addIcon("Documents", 0, 1, 2);
+    addIcon("Network", 0, 2, 5);
+    addIcon("Recycle Bin", 0, 3, 3);
+    addIcon("Browser", 0, 4, 6);
+}
 
-    const nn = @min(name.len, MAX_ICON_NAME_LEN);
-    @memcpy(icon.name[0..nn], name[0..nn]);
-    icon.name_len = nn;
-
-    const tp = @min(target_path.len, MAX_ICON_PATH_LEN);
-    @memcpy(icon.target_path[0..tp], target_path[0..tp]);
-    icon.target_path_len = tp;
-
-    arrangeIcon(icon, icon_count);
+fn addIcon(name: []const u8, gx: i32, gy: i32, id: u16) void {
+    if (icon_count >= MAX_ICONS) return;
+    var ic = &icons[icon_count];
+    const len = @min(name.len, 64);
+    for (0..len) |i| {
+        ic.name[i] = name[i];
+    }
+    ic.name_len = @intCast(len);
+    ic.grid_x = gx;
+    ic.grid_y = gy;
+    ic.icon_id = id;
+    ic.visible = true;
     icon_count += 1;
-    return icon;
 }
 
-pub fn removeIcon(index: usize) bool {
-    if (index >= icon_count) return false;
-    if (icons[index].is_system) return false;
-    var j = index;
-    while (j + 1 < icon_count) : (j += 1) {
-        icons[j] = icons[j + 1];
-    }
-    icons[icon_count - 1] = .{};
-    icon_count -= 1;
-    rearrangeIcons();
-    return true;
-}
-
-pub fn getIcon(index: usize) ?*const DesktopIcon {
-    if (index < icon_count and icons[index].is_visible) {
-        return &icons[index];
-    }
-    return null;
+pub fn getIcons() []const DesktopIcon {
+    return icons[0..icon_count];
 }
 
 pub fn getIconCount() usize {
@@ -177,30 +65,79 @@ pub fn getIconCount() usize {
 }
 
 pub fn selectIcon(index: usize) void {
-    for (icons[0..icon_count]) |*icon| {
-        icon.is_selected = false;
-    }
+    deselectAll();
     if (index < icon_count) {
-        icons[index].is_selected = true;
+        icons[index].selected = true;
     }
 }
 
 pub fn deselectAll() void {
-    for (icons[0..icon_count]) |*icon| {
-        icon.is_selected = false;
+    for (&icons) |*ic| {
+        ic.selected = false;
     }
 }
 
-pub fn hitTestIcon(x: i32, y: i32) ?usize {
-    var i: usize = icon_count;
-    while (i > 0) {
-        i -= 1;
-        const icon = &icons[i];
-        if (!icon.is_visible) continue;
-        if (x >= icon.pixel_x and
-            x < icon.pixel_x + theme.DESKTOP_ICON_SPACING_X and
-            y >= icon.pixel_y and
-            y < icon.pixel_y + theme.DESKTOP_ICON_SPACING_Y)
+pub fn showContextMenu(x: i32, y: i32) void {
+    context_menu_visible = true;
+    context_menu_x = x;
+    context_menu_y = y;
+}
+
+pub fn hideContextMenu() void {
+    context_menu_visible = false;
+}
+
+pub fn isContextMenuVisible() bool {
+    return context_menu_visible;
+}
+
+pub fn getContextMenuPos() struct { x: i32, y: i32 } {
+    return .{ .x = context_menu_x, .y = context_menu_y };
+}
+
+pub fn getDesktopBackground() u32 {
+    return theme.getActiveDesktopBg();
+}
+
+pub fn getDesktopBackgroundDefault() u32 {
+    return theme.desktop_bg;
+}
+
+fn updateWallpaperPath() void {
+    wallpaper_path = theme.getWallpaperForScheme(theme.getActiveScheme());
+    wallpaper_dirty = true;
+}
+
+pub fn getWallpaperPath() []const u8 {
+    return wallpaper_path.path[0..wallpaper_path.len];
+}
+
+pub fn isWallpaperDirty() bool {
+    return wallpaper_dirty;
+}
+
+pub fn clearWallpaperDirty() void {
+    wallpaper_dirty = false;
+}
+
+pub fn applyTheme(cs: theme.ColorScheme) void {
+    theme.setActiveScheme(cs);
+    updateWallpaperPath();
+}
+
+pub fn iconHitTest(click_x: i32, click_y: i32) ?usize {
+    const grid_x_step = theme.Layout.icon_grid_x;
+    const grid_y_step = theme.Layout.icon_grid_y;
+    const icon_sz = theme.Layout.icon_size;
+    const margin_x: i32 = 16;
+    const margin_y: i32 = 16;
+
+    for (icons[0..icon_count], 0..) |ic, i| {
+        if (!ic.visible) continue;
+        const ix = margin_x + ic.grid_x * grid_x_step;
+        const iy = margin_y + ic.grid_y * grid_y_step;
+        if (click_x >= ix and click_x < ix + icon_sz and
+            click_y >= iy and click_y < iy + icon_sz + 16)
         {
             return i;
         }
@@ -208,146 +145,18 @@ pub fn hitTestIcon(x: i32, y: i32) ?usize {
     return null;
 }
 
-fn arrangeIcon(icon: *DesktopIcon, index: usize) void {
-    const margin = theme.DESKTOP_ICON_MARGIN;
-    const spacing_x = settings.icon_spacing_x;
-    const spacing_y = settings.icon_spacing_y;
-    const max_rows: usize = @intCast(@divTrunc(desktop_height - theme.TASKBAR_HEIGHT - margin, spacing_y));
-    const effective_max = if (max_rows > 0) max_rows else 1;
-
-    icon.grid_x = @intCast(index / effective_max);
-    icon.grid_y = @intCast(index % effective_max);
-    icon.pixel_x = margin + icon.grid_x * spacing_x;
-    icon.pixel_y = margin + icon.grid_y * spacing_y;
-}
-
-pub fn rearrangeIcons() void {
-    var visible_idx: usize = 0;
-    for (icons[0..icon_count]) |*icon| {
-        if (icon.is_visible) {
-            arrangeIcon(icon, visible_idx);
-            visible_idx += 1;
-        }
+pub fn removeIcon(index: usize) void {
+    if (index >= icon_count) return;
+    var i = index;
+    while (i + 1 < icon_count) : (i += 1) {
+        icons[i] = icons[i + 1];
     }
+    icons[icon_count - 1] = .{};
+    icon_count -= 1;
 }
 
-// ── Wallpaper ──
-
-pub fn setWallpaper(path: []const u8, style: WallpaperStyle) void {
-    const n = @min(path.len, wallpaper.path.len);
-    @memcpy(wallpaper.path[0..n], path[0..n]);
-    wallpaper.path_len = n;
-    wallpaper.style = style;
-    wallpaper.is_set = true;
-}
-
-pub fn setWallpaperColor(color: COLORREF) void {
-    wallpaper.style = .solid_color;
-    wallpaper.solid_color = color;
-    wallpaper.is_set = true;
-}
-
-pub fn getWallpaper() *const Wallpaper {
-    return &wallpaper;
-}
-
-pub fn getDesktopColor() COLORREF {
-    if (wallpaper.is_set and wallpaper.style == .solid_color) {
-        return wallpaper.solid_color;
-    }
-    return theme.getColors().desktop_background;
-}
-
-// ── Context Menu ── (flat Metro style)
-
-pub fn showContextMenu(x: i32, y: i32) void {
-    context_menu = .{};
-    context_menu.x = x;
-    context_menu.y = y;
-    context_menu.is_visible = true;
-
-    addContextItem("View", .submenu, 100);
-    addContextItem("Sort by", .submenu, 101);
-    addContextItem("Refresh", .normal, 102);
-    addContextItem("", .separator, 0);
-    addContextItem("Paste", .disabled, 103);
-    addContextItem("Paste shortcut", .disabled, 104);
-    addContextItem("", .separator, 0);
-    addContextItem("New", .submenu, 110);
-    addContextItem("", .separator, 0);
-    addContextItem("Personalize", .normal, 120);
-}
-
-pub fn hideContextMenu() void {
-    context_menu.is_visible = false;
-}
-
-pub fn getContextMenu() *const ContextMenu {
-    return &context_menu;
-}
-
-pub fn getContextMenuColors() struct {
-    bg: COLORREF,
-    text: COLORREF,
-    hover: COLORREF,
-    separator: COLORREF,
-} {
-    const colors = theme.getColors();
-    return .{
-        .bg = colors.context_menu_bg,
-        .text = colors.context_menu_text,
-        .hover = colors.context_menu_hover,
-        .separator = colors.separator,
-    };
-}
-
-fn addContextItem(label: []const u8, item_type: ContextMenuItemType, cmd_id: u32) void {
-    if (context_menu.item_count >= MAX_CONTEXT_ITEMS) return;
-    var item = &context_menu.items[context_menu.item_count];
-    item.* = .{};
-    item.item_type = item_type;
-    item.command_id = cmd_id;
-    const n = @min(label.len, item.label.len);
-    @memcpy(item.label[0..n], label[0..n]);
-    item.label_len = n;
-    context_menu.item_count += 1;
-}
-
-// ── Settings ──
-
-pub fn getSettings() *const DesktopSettings {
-    return &settings;
-}
-
-pub fn setDesktopSize(width: i32, height: i32) void {
-    desktop_width = width;
-    desktop_height = height;
-    rearrangeIcons();
-}
-
-pub fn getDesktopSize() struct { width: i32, height: i32 } {
-    return .{ .width = desktop_width, .height = desktop_height };
-}
-
-// ── Initialization ── (minimal: only PC and Recycle Bin)
-
-fn createSystemIcons() void {
-    if (settings.show_this_pc) {
-        _ = addIcon("This PC", "C:\\", .this_pc, true);
-    }
-    if (settings.show_recycle_bin) {
-        _ = addIcon("Recycle Bin", "C:\\$Recycle.Bin", .recycle_bin, true);
-    }
-}
-
-pub fn init() void {
-    icon_count = 0;
-    context_menu = .{};
-    settings = .{};
-
-    const colors = theme.getColors();
-    setWallpaperColor(colors.desktop_background);
-    createSystemIcons();
-
-    desktop_initialized = true;
+pub fn moveIcon(index: usize, new_gx: i32, new_gy: i32) void {
+    if (index >= icon_count) return;
+    icons[index].grid_x = new_gx;
+    icons[index].grid_y = new_gy;
 }

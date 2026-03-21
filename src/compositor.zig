@@ -1,10 +1,13 @@
-//! Compositor - ZirconOS Modern Opaque Compositing Engine
-//! Simple compositor optimized for flat, opaque surfaces.
-//! No alpha blending needed for most operations, enabling
-//! fast full-screen compositing for tiles and Start Screen.
+//! Compositor - ZirconOS Modern Basic Desktop Compositor
+//! Simplified compositing engine with opaque surface blitting.
+//! No glass, no blur, no transparency — Metro flat design.
+//! Each window renders to its own surface; the compositor merges
+//! them in Z-order with simple opaque blit operations.
+//! VSync-aligned frame presentation ensures zero tearing.
 
 const theme = @import("theme.zig");
 const renderer = @import("renderer.zig");
+const input = @import("input.zig");
 
 pub const Rect = renderer.Rect;
 pub const COLORREF = theme.COLORREF;
@@ -13,12 +16,18 @@ pub const MAX_SURFACES: usize = 64;
 pub const MAX_DAMAGE_RECTS: usize = 16;
 pub const INVALID_SURFACE: u32 = 0;
 
+pub const CURSOR_SURFACE_Z: i32 = 0x7FFFFF00;
+pub const DESKTOP_SURFACE_Z: i32 = -0x7FFFFF00;
+
 pub const SurfaceFlags = struct {
     has_alpha: bool = false,
     needs_shadow: bool = false,
     is_visible: bool = true,
     is_opaque: bool = true,
-    is_fullscreen: bool = false,
+    needs_blur: bool = false,
+    is_glass: bool = false,
+    is_cursor: bool = false,
+    is_desktop: bool = false,
 };
 
 pub const Surface = struct {
@@ -77,18 +86,26 @@ pub const CompositorStats = struct {
     surfaces_composited: u64 = 0,
     full_redraws: u64 = 0,
     partial_redraws: u64 = 0,
+    cursor_redraws: u64 = 0,
+    vsync_misses: u64 = 0,
 };
 
-pub const LayerType = enum(u8) {
-    desktop = 0,
-    start_screen = 1,
-    normal_window = 2,
-    floating_window = 3,
-    taskbar = 4,
-    charms_bar = 5,
-    app_bar = 6,
-    tooltip = 7,
-    cursor = 8,
+pub const CursorLayer = struct {
+    x: i32 = 0,
+    y: i32 = 0,
+    prev_x: i32 = -1,
+    prev_y: i32 = -1,
+    width: i32 = 12,
+    height: i32 = 19,
+    visible: bool = true,
+    surface_id: u32 = INVALID_SURFACE,
+    needs_redraw: bool = true,
+};
+
+pub const VsyncState = struct {
+    enabled: bool = true,
+    frame_target_us: u64 = 16667,
+    last_present_tick: u64 = 0,
 };
 
 var surfaces: [MAX_SURFACES]Surface = [_]Surface{.{}} ** MAX_SURFACES;
@@ -101,6 +118,9 @@ var compositor_dirty: bool = true;
 var stats: CompositorStats = .{};
 var compositor_initialized: bool = false;
 
+var cursor_layer: CursorLayer = .{};
+var vsync_state: VsyncState = .{};
+
 pub fn init(width: u32, height: u32) void {
     screen_width = width;
     screen_height = height;
@@ -108,6 +128,19 @@ pub fn init(width: u32, height: u32) void {
     next_surface_id = 1;
     compositor_dirty = true;
     stats = .{};
+    cursor_layer = .{};
+    vsync_state = .{};
+
+    cursor_layer.surface_id = createSurface(12, 19, .{
+        .has_alpha = true,
+        .is_visible = true,
+        .is_cursor = true,
+        .is_opaque = false,
+    });
+    if (getSurface(cursor_layer.surface_id)) |sfc| {
+        sfc.z_order = CURSOR_SURFACE_Z;
+    }
+
     compositor_initialized = true;
 }
 
@@ -124,6 +157,7 @@ pub fn createSurface(width: u32, height: u32, flags: SurfaceFlags) u32 {
     sfc.height = height;
     sfc.flags = flags;
     sfc.dirty = true;
+    sfc.alpha = 255;
 
     surface_count += 1;
     compositor_dirty = true;
@@ -131,6 +165,8 @@ pub fn createSurface(width: u32, height: u32, flags: SurfaceFlags) u32 {
 }
 
 pub fn destroySurface(id: u32) bool {
+    if (id == cursor_layer.surface_id) return false;
+
     var i: usize = 0;
     while (i < surface_count) {
         if (surfaces[i].id == id) {
@@ -195,10 +231,45 @@ pub fn setSurfaceVisible(id: u32, visible: bool) void {
     }
 }
 
+pub fn updateCursorPosition(x: i32, y: i32) void {
+    if (x == cursor_layer.x and y == cursor_layer.y) return;
+
+    cursor_layer.prev_x = cursor_layer.x;
+    cursor_layer.prev_y = cursor_layer.y;
+    cursor_layer.x = x;
+    cursor_layer.y = y;
+    cursor_layer.needs_redraw = true;
+
+    if (getSurface(cursor_layer.surface_id)) |sfc| {
+        sfc.x = x;
+        sfc.y = y;
+        sfc.markFullDirty();
+    }
+}
+
+pub fn setCursorVisible(visible: bool) void {
+    cursor_layer.visible = visible;
+    if (getSurface(cursor_layer.surface_id)) |sfc| {
+        sfc.flags.is_visible = visible;
+    }
+    compositor_dirty = true;
+}
+
+pub fn getCursorPosition() struct { x: i32, y: i32 } {
+    return .{ .x = cursor_layer.x, .y = cursor_layer.y };
+}
+
 pub fn compose() void {
     if (!compositor_initialized) return;
 
     stats.total_frames += 1;
+
+    const cursor_only = cursor_layer.needs_redraw and !needsSceneRedraw();
+
+    if (cursor_only) {
+        composeCursorOnly();
+        return;
+    }
 
     if (!needsRedraw()) return;
     stats.dirty_frames += 1;
@@ -214,6 +285,7 @@ pub fn compose() void {
 
     var has_partial = false;
     for (surfaces[0..surface_count]) |*sfc| {
+        if (sfc.flags.is_cursor) continue;
         if (sfc.dirty and sfc.damage_count > 0) {
             has_partial = true;
             break;
@@ -232,6 +304,40 @@ pub fn compose() void {
         sfc.clearDamage();
     }
     compositor_dirty = false;
+    cursor_layer.needs_redraw = false;
+
+    renderer.flushRender();
+}
+
+fn composeCursorOnly() void {
+    if (cursor_layer.prev_x >= 0 and cursor_layer.prev_y >= 0) {
+        const restore_rect = Rect{
+            .x = cursor_layer.prev_x,
+            .y = cursor_layer.prev_y,
+            .w = cursor_layer.width + 2,
+            .h = cursor_layer.height + 2,
+        };
+        renderer.setClip(restore_rect);
+        renderer.fillRect(restore_rect, theme.getColors().desktop_background);
+
+        for (surfaces[0..surface_count]) |*sfc| {
+            if (!sfc.flags.is_visible or sfc.flags.is_cursor) continue;
+            const bounds = sfc.getBounds();
+            if (restore_rect.intersects(bounds)) {
+                composeSurface(sfc);
+            }
+        }
+        renderer.clearClip();
+    }
+
+    if (cursor_layer.visible) {
+        if (getSurface(cursor_layer.surface_id)) |sfc| {
+            composeSurface(sfc);
+        }
+    }
+
+    cursor_layer.needs_redraw = false;
+    stats.cursor_redraws += 1;
 
     renderer.flushRender();
 }
@@ -272,7 +378,17 @@ fn composeSurface(sfc: *const Surface) void {
 
 fn needsRedraw() bool {
     if (compositor_dirty) return true;
+    if (cursor_layer.needs_redraw) return true;
     for (surfaces[0..surface_count]) |*sfc| {
+        if (sfc.dirty) return true;
+    }
+    return false;
+}
+
+fn needsSceneRedraw() bool {
+    if (compositor_dirty) return true;
+    for (surfaces[0..surface_count]) |*sfc| {
+        if (sfc.flags.is_cursor) continue;
         if (sfc.dirty) return true;
     }
     return false;
@@ -315,4 +431,22 @@ pub fn markAllDirty() void {
         sfc.markFullDirty();
     }
     compositor_dirty = true;
+}
+
+pub fn getCursorLayer() *const CursorLayer {
+    return &cursor_layer;
+}
+
+pub fn getVsyncState() *const VsyncState {
+    return &vsync_state;
+}
+
+pub fn setVsyncEnabled(enabled: bool) void {
+    vsync_state.enabled = enabled;
+}
+
+pub fn setRefreshRate(hz: u32) void {
+    if (hz > 0) {
+        vsync_state.frame_target_us = 1_000_000 / @as(u64, hz);
+    }
 }

@@ -1,7 +1,7 @@
 //! Renderer - ZirconOS Modern Rendering Abstraction Layer
-//! Flat rendering with no gradients or shadows by default.
-//! drawShadow is a no-op (Modern UI has no window shadows).
-//! draw3DFrame draws flat 1px borders instead of 3D effects.
+//! Provides a platform-independent drawing interface with Metro-specific
+//! flat design: sharp rectangles, no rounded corners, no gradients,
+//! no blur, no shadows — pure solid-color geometry.
 
 const theme = @import("theme.zig");
 
@@ -79,11 +79,10 @@ pub const TextAlignment = enum(u8) {
 };
 
 pub const FontWeight = enum(u8) {
-    light = 0,
-    semilight = 1,
-    normal = 2,
+    normal = 0,
+    bold = 1,
+    light = 2,
     semibold = 3,
-    bold = 4,
 };
 
 pub const FontSpec = struct {
@@ -92,17 +91,10 @@ pub const FontSpec = struct {
     weight: FontWeight = .normal,
 };
 
-pub const GradientDirection = enum(u8) {
-    horizontal = 0,
-    vertical = 1,
-};
-
 pub const RenderOps = struct {
     fill_rect: ?*const fn (rect: Rect, color: COLORREF) void = null,
     draw_rect: ?*const fn (rect: Rect, color: COLORREF, width: i32) void = null,
     draw_line: ?*const fn (x1: i32, y1: i32, x2: i32, y2: i32, color: COLORREF) void = null,
-    draw_gradient: ?*const fn (rect: Rect, start: COLORREF, end: COLORREF, dir: GradientDirection) void = null,
-    draw_round_rect: ?*const fn (rect: Rect, color: COLORREF, radius: i32) void = null,
     draw_text: ?*const fn (text: []const u8, rect: Rect, color: COLORREF, font: FontSpec, alignment: TextAlignment) void = null,
     draw_icon: ?*const fn (icon_id: u32, x: i32, y: i32, size: i32) void = null,
     draw_bitmap: ?*const fn (bitmap_id: u32, dest: Rect) void = null,
@@ -110,6 +102,7 @@ pub const RenderOps = struct {
     clear_clip: ?*const fn () void = null,
     blit_surface: ?*const fn (surface_id: u32, dest: Rect, alpha: u8) void = null,
     flush: ?*const fn () void = null,
+    fill_rect_alpha: ?*const fn (rect: Rect, color: COLORREF, alpha: u8) void = null,
 };
 
 var render_ops: RenderOps = .{};
@@ -132,14 +125,6 @@ pub fn drawRect(rect: Rect, color: COLORREF, width: i32) void {
 
 pub fn drawLine(x1: i32, y1: i32, x2: i32, y2: i32, color: COLORREF) void {
     if (render_ops.draw_line) |f| f(x1, y1, x2, y2, color);
-}
-
-pub fn drawGradient(rect: Rect, start: COLORREF, end: COLORREF, dir: GradientDirection) void {
-    if (render_ops.draw_gradient) |f| f(rect, start, end, dir);
-}
-
-pub fn drawRoundRect(rect: Rect, color: COLORREF, radius: i32) void {
-    if (render_ops.draw_round_rect) |f| f(rect, color, radius);
 }
 
 pub fn drawText(text: []const u8, rect: Rect, color: COLORREF, font: FontSpec, alignment: TextAlignment) void {
@@ -170,17 +155,42 @@ pub fn flushRender() void {
     if (render_ops.flush) |f| f();
 }
 
-/// No-op: Modern UI does not use window shadows.
-pub fn drawShadow(_: Rect, _: i32) void {}
-
-/// Flat 1px border instead of 3D raised/sunken frame.
-pub fn draw3DFrame(rect: Rect, _: bool) void {
-    const colors = theme.getColors();
-    drawRect(rect, colors.separator, 1);
+pub fn fillRectAlpha(rect: Rect, color: COLORREF, alpha: u8) void {
+    if (render_ops.fill_rect_alpha) |f| {
+        f(rect, color, alpha);
+    } else {
+        fillRect(rect, theme.alphaBlend(color, theme.RGB(0xFF, 0xFF, 0xFF), alpha));
+    }
 }
 
-/// Flat filled rectangle with 1px border.
-pub fn drawFlatPanel(rect: Rect, fill: COLORREF, border: COLORREF) void {
-    fillRect(rect, fill);
-    drawRect(rect, border, 1);
+/// Metro flat 1px border frame (no rounded corners, no 3D effect)
+pub fn drawFlatFrame(rect: Rect, active: bool) void {
+    const border_color = if (active) theme.window_border else theme.window_border_inactive;
+    drawRect(rect, border_color, theme.Layout.window_border_width);
+}
+
+/// Metro flat titlebar (solid accent color, no gradient)
+pub fn renderFlatTitlebar(rect: Rect) void {
+    const colors = theme.getColors();
+    fillRect(.{
+        .x = rect.x,
+        .y = rect.y,
+        .w = rect.w,
+        .h = theme.Layout.titlebar_height,
+    }, colors.titlebar_active);
+}
+
+/// Render Metro desktop background (solid accent color)
+pub fn renderDesktopBackground(rect: Rect) void {
+    fillRect(rect, theme.getColors().desktop_background);
+}
+
+/// Metro flat taskbar (solid dark background, no glass)
+pub fn renderFlatTaskbar(rect: Rect) void {
+    fillRect(rect, theme.taskbar_bg);
+}
+
+/// Metro tile rendering (solid colored rectangle with text)
+pub fn renderTile(rect: Rect, color: COLORREF) void {
+    fillRect(rect, color);
 }
